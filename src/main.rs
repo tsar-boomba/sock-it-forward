@@ -11,7 +11,7 @@ use crate::{
     public_side::{PublicConfig, public_side},
 };
 
-const ALPN: &[u8] = b"sock-it-forward-0";
+const ALPN: &[u8] = b"/sock-it-forward/0";
 
 #[derive(clap::Parser)]
 enum Command {
