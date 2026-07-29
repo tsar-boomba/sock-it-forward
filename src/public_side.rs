@@ -6,7 +6,6 @@ use std::{
 use arc_swap::ArcSwapOption;
 use color_eyre::eyre::Context;
 use iroh::{Endpoint, endpoint::presets};
-use iroh_tickets::endpoint::EndpointTicket;
 use proxy_protocol::{
     ProxyHeader,
     version2::{ProxyAddresses, ProxyCommand, ProxyTransportProtocol},
@@ -66,7 +65,7 @@ impl PublicServer {
 
                 let (mut tcp_recv, mut tcp_send) = stream.split();
 
-                let (quic_to_tcp_res, tcp_to_quic_res) = tokio::join!(
+                let (_quic_to_tcp_res, _tcp_to_quic_res) = tokio::join!(
                     tokio::io::copy(&mut recv, &mut tcp_send),
                     tokio::io::copy(&mut tcp_recv, &mut send)
                 );

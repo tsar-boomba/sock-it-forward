@@ -27,7 +27,7 @@ impl PrivateServer {
         let mut stream = TcpStream::connect(target_addr).await?;
         let (mut tcp_recv, mut tcp_send) = stream.split();
 
-        let (quic_to_tcp_res, tcp_to_quic_res) = tokio::join!(
+        let (_quic_to_tcp_res, _tcp_to_quic_res) = tokio::join!(
             tokio::io::copy(&mut recv, &mut tcp_send),
             tokio::io::copy(&mut tcp_recv, &mut send)
         );
