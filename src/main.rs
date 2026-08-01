@@ -1,9 +1,10 @@
+mod listener;
+mod port_mapping;
 mod private_side;
 mod public_side;
 
 use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    net::SocketAddr, path::{Path, PathBuf}, sync::Arc,
 };
 
 use clap::Parser;
@@ -11,8 +12,7 @@ use color_eyre::eyre::Context;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    private_side::{PrivateConfig, private_side},
-    public_side::{PublicConfig, public_side},
+    port_mapping::PortMapping, private_side::{PrivateConfig, private_side}, public_side::{PublicConfig, public_side},
 };
 
 const ALPN: &[u8] = b"/sock-it-forward/0";
@@ -21,9 +21,7 @@ const ALPN: &[u8] = b"/sock-it-forward/0";
 enum Command {
     Public {
         #[arg(short, long)]
-        addr: SocketAddr,
-        #[arg(short, long, default_value = "true")]
-        proxy_protocol: bool,
+        addrs: Vec<SocketAddr>,
         /// Only allowed private-side public key in Base64 or hex
         #[arg(short = 'k', long)]
         private_side_key: Option<iroh::PublicKey>,
@@ -32,13 +30,13 @@ enum Command {
         secret_key: Option<PathBuf>,
     },
     Private {
-        #[arg(short = 'a', long)]
-        target_addr: SocketAddr,
         #[arg(short, long)]
         public_side_key: iroh::PublicKey,
         /// Loads/creates a key in this file
         #[arg(short, long)]
         secret_key: Option<PathBuf>,
+        #[arg(short = 'm', long = "map", required = true)]
+        mappings: Vec<PortMapping>,
     },
 }
 
@@ -46,7 +44,7 @@ fn main() -> color_eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or(EnvFilter::new("info,sock_it_forward=debug")),
+                .unwrap_or(EnvFilter::new("info,iroh::net_report::report=error,sock_it_forward=debug")),
         )
         .init();
 
@@ -55,14 +53,12 @@ fn main() -> color_eyre::Result<()> {
     let rt = tokio::runtime::LocalRuntime::new().unwrap();
     match command {
         Command::Public {
-            addr,
-            proxy_protocol,
+            addrs,
             private_side_key,
             secret_key,
         } => {
             rt.block_on(public_side(PublicConfig {
-                addr,
-                proxy_protocol,
+                addrs,
                 allowed_peer_key: private_side_key,
                 secret_key: if let Some(path) = secret_key {
                     load_secret_key(&path)?
@@ -72,13 +68,13 @@ fn main() -> color_eyre::Result<()> {
             }))?;
         }
         Command::Private {
-            target_addr,
             public_side_key,
             secret_key,
+            mappings,
         } => {
             rt.block_on(private_side(PrivateConfig {
-                target_addr,
                 public_endpoint_addr: iroh::EndpointAddr::new(public_side_key),
+                port_mappings: Arc::from(mappings),
                 secret_key: if let Some(path) = secret_key {
                     // load/create file
                     load_secret_key(&path)?

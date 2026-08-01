@@ -3022,6 +3022,7 @@ dependencies = [
  "arc-swap",
  "clap",
  "color-eyre",
+ "futures-util",
  "iroh",
  "num_cpus",
  "proxy-protocol",
