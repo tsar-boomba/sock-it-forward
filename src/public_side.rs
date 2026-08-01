@@ -6,7 +6,6 @@ use proxy_protocol::{
     ProxyHeader,
     version2::{ProxyAddresses, ProxyCommand, ProxyTransportProtocol},
 };
-use tokio::io::AsyncWriteExt;
 
 use crate::{
     ALPN,

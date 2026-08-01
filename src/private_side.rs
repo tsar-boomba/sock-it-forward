@@ -143,6 +143,7 @@ pub async fn private_side(config: PrivateConfig) -> color_eyre::Result<()> {
 
 #[derive(Debug)]
 pub struct ProxyInfo {
+    #[allow(dead_code)]
     pub source_addr: SocketAddr,
     /// SocketAddr on public side that accepted the connection. Use the port
     /// number here to determine the upstream to send to
