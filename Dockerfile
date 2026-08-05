@@ -31,8 +31,14 @@ COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
 RUN cargo build --release
 
+# Fetch a static dumb-init binary for the target arch.
+# uname -m yields x86_64 / aarch64, which matches dumb-init's release asset names.
+RUN curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_$(uname -m)" \
+    -o /usr/local/bin/dumb-init \
+    && chmod +x /usr/local/bin/dumb-init
+
 FROM --platform=$BUILDPLATFORM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
+COPY --from=builder /usr/local/bin/dumb-init /usr/local/bin/dumb-init
 COPY --from=builder /app/target/release/sock-it-forward /sock-it-forward
-ENV LISTEN_ADDR=0.0.0.0:80
-ENTRYPOINT ["/sock-it-forward"]
+ENTRYPOINT ["/usr/local/bin/dumb-init", "--", "/sock-it-forward"]
