@@ -64,7 +64,7 @@
               mappings = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
-                example = [ "8080:localhost:80" ];
+                example = [ "8080:127.0.0.1:80" ];
                 description = "Port mappings (private mode).";
               };
             };

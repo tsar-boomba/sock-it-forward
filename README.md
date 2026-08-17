@@ -17,8 +17,8 @@ I use nix on my server, so I made a flake to easily build and run this as a syst
     private = {
       publicSideKey = "PASTE_PUBLIC_SIDE_PUBKEY_HERE";
       mappings = [
-        "8080:localhost:80"
-        "2222:localhost:22"
+        "8080:127.0.0.1:80"
+        "2222:127.0.0.1:22"
       ];
     };
   };
