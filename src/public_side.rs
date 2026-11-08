@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwapOption;
 use iroh::{Endpoint, endpoint::presets};
@@ -10,7 +10,11 @@ use proxy_protocol::{
 use crate::{
     ALPN,
     listener::{Accepted, Listeners},
+    proxy::{ActiveStreams, proxy, set_keepalive},
 };
+
+/// Max time to wait for the private side to allow a new stream
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PublicConfig {
     pub addrs: Vec<SocketAddr>,
@@ -23,6 +27,7 @@ pub struct PublicConfig {
 #[derive(Clone)]
 struct PublicState {
     iroh_conn: Arc<ArcSwapOption<iroh::endpoint::Connection>>,
+    active_streams: ActiveStreams,
 }
 
 struct PublicServer {
@@ -37,21 +42,42 @@ impl PublicServer {
             local_addr,
             remote_addr,
         } = self.listeners.accept().await;
-        tracing::debug!("forwarding conn on {local_addr} from {remote_addr}");
+        tracing::debug!(
+            "forwarding conn on {local_addr} from {remote_addr} ({} active)",
+            self.state.active_streams.get()
+        );
 
         tokio::task::spawn_local({
             let state = self.state.clone();
             async move {
+                let _active = state.active_streams.track();
+
                 let conn_opt = state.iroh_conn.load();
                 let Some(iroh_conn) = conn_opt.as_deref() else {
                     tracing::warn!("got conn without private side connected!");
                     return;
                 };
 
-                let Ok((mut send, mut recv)) = iroh_conn.open_bi().await else {
-                    tracing::warn!("Couldn't open new bidi");
-                    return;
-                };
+                set_keepalive(&stream);
+
+                // open_bi only waits when the private side's stream limit is hit. If it doesn't
+                // free up in time, close the conn so the private side reconnects with a fresh limit
+                let (mut send, mut recv) =
+                    match tokio::time::timeout(OPEN_STREAM_TIMEOUT, iroh_conn.open_bi()).await {
+                        Ok(Ok(streams)) => streams,
+                        Ok(Err(err)) => {
+                            tracing::warn!("Couldn't open new bidi: {err:?}");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "Timed out opening new bidi ({} active), closing conn to private side",
+                                state.active_streams.get()
+                            );
+                            iroh_conn.close(0u32.into(), b"stream limit reached");
+                            return;
+                        }
+                    };
 
                 // Write connection information into stream before data
                 // this is used on the private side for routing. Private side
@@ -65,16 +91,9 @@ impl PublicServer {
                     return;
                 };
 
-                let (mut tcp_recv, mut tcp_send) = stream.split();
-
-                // Poll both until either fails
-                tokio::select! {
-                    _ = tokio::io::copy(&mut recv, &mut tcp_send) => {}
-                    _ = tokio::io::copy(&mut tcp_recv, &mut send) => {}
-                };
-
-                send.reset(0u32.into()).ok();
-                recv.stop(0u32.into()).ok();
+                if let Err(err) = proxy(&mut stream, &mut send, &mut recv).await {
+                    tracing::debug!("conn from {remote_addr} ended with error: {err}");
+                }
             }
         });
 
@@ -110,6 +129,7 @@ pub async fn public_side(config: PublicConfig) -> color_eyre::Result<()> {
 
     let state = Arc::new(PublicState {
         iroh_conn: Arc::new(ArcSwapOption::empty()),
+        active_streams: ActiveStreams::default(),
     });
 
     // Spawn up to n-1 threads for handling incoming connections

@@ -1,18 +1,13 @@
-FROM --platform=$BUILDPLATFORM debian:bullseye-slim AS chef
+FROM debian:bookworm-slim AS chef
 WORKDIR /app
 
-# Update default packages
-RUN apt-get update
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       curl \
+       ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Get Ubuntu packages
-RUN apt-get install -y \
-    build-essential \
-    curl
-
-# Update new packages
-RUN apt-get update
-
-# Get Rust and cargo-chef
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo install --locked --version 0.1.77 cargo-chef
@@ -37,7 +32,7 @@ RUN curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-
     -o /usr/local/bin/dumb-init \
     && chmod +x /usr/local/bin/dumb-init
 
-FROM --platform=$BUILDPLATFORM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
 COPY --from=builder /usr/local/bin/dumb-init /usr/local/bin/dumb-init
 COPY --from=builder /app/target/release/sock-it-forward /sock-it-forward

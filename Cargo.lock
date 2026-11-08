@@ -3026,6 +3026,7 @@ dependencies = [
  "iroh",
  "num_cpus",
  "proxy-protocol",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1,6 +1,7 @@
 mod listener;
 mod port_mapping;
 mod private_side;
+mod proxy;
 mod public_side;
 
 use std::{

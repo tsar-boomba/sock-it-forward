@@ -5,13 +5,21 @@ use std::{
     time::Duration,
 };
 
+use color_eyre::eyre::{WrapErr, eyre};
 use iroh::{
     Endpoint, EndpointAddr,
-    endpoint::{RecvStream, SendStream, presets},
+    endpoint::{Connection, RecvStream, SendStream, presets},
 };
-use tokio::{io::AsyncWriteExt, net::TcpStream, select};
+use tokio::{io::AsyncWriteExt, net::TcpStream, select, sync::broadcast};
 
-use crate::{ALPN, port_mapping::PortMapping};
+use crate::{
+    ALPN,
+    port_mapping::PortMapping,
+    proxy::{ActiveStreams, proxy, set_keepalive},
+};
+
+/// Max time to wait for the proxy header and the upstream connection
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PrivateConfig {
     pub public_endpoint_addr: EndpointAddr,
@@ -22,58 +30,69 @@ pub struct PrivateConfig {
 
 struct PrivateServer {
     port_mappings: Arc<[PortMapping]>,
-    iroh_conn_recv: tokio::sync::broadcast::Receiver<iroh::endpoint::Connection>,
+    iroh_conn_recv: broadcast::Receiver<Connection>,
+    active_streams: ActiveStreams,
 }
 
 impl PrivateServer {
     async fn handle_stream(
         port_mappings: Arc<[PortMapping]>,
+        active_streams: ActiveStreams,
         mut send: SendStream,
         mut recv: RecvStream,
+    ) {
+        let _active = active_streams.track();
+
+        if let Err(err) = Self::proxy_stream(&port_mappings, &active_streams, &mut send, &mut recv).await {
+            // Reset so the public side drops its TCP conn and the stream frees up right away
+            send.reset(0u32.into()).ok();
+            recv.stop(0u32.into()).ok();
+            tracing::warn!("{err:#}");
+        }
+    }
+
+    async fn proxy_stream(
+        port_mappings: &[PortMapping],
+        active_streams: &ActiveStreams,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
     ) -> color_eyre::Result<()> {
-        let proxy_info = read_proxy_header(&mut recv).await?;
+        let proxy_info = tokio::time::timeout(SETUP_TIMEOUT, read_proxy_header(recv))
+            .await
+            .wrap_err("Timed out reading proxy header")??;
         let Some(mapping) = port_mappings
             .iter()
             .find(|mapping| mapping.source_port == proxy_info.dest_addr.port())
         else {
-            tracing::warn!("No mapping for {}", proxy_info.dest_addr.port());
-            return Ok(());
+            return Err(eyre!("No mapping for {}", proxy_info.dest_addr.port()));
         };
 
         tracing::debug!(
-            "proxying from {} to {}",
+            "proxying from {} to {} ({} active)",
             proxy_info.dest_addr,
-            mapping.dest_addr
+            mapping.dest_addr,
+            active_streams.get()
         );
-        let mut stream = match TcpStream::connect(mapping.dest_addr).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                send.finish().ok();
-                recv.stop(0u32.into()).ok();
-                tracing::warn!("Failed to connect to upstream at {}", mapping.dest_addr);
-                return Err(err.into());
-            }
-        };
-        let (mut tcp_recv, mut tcp_send) = stream.split();
+        let mut stream = tokio::time::timeout(SETUP_TIMEOUT, TcpStream::connect(mapping.dest_addr))
+            .await
+            .wrap_err_with(|| format!("Timed out connecting to upstream at {}", mapping.dest_addr))?
+            .wrap_err_with(|| format!("Failed to connect to upstream at {}", mapping.dest_addr))?;
+        set_keepalive(&stream);
 
         if mapping.proxy_protocol {
-            tcp_send.write_all(&proxy_info.raw_header).await?;
+            stream.write_all(&proxy_info.raw_header).await?;
         }
 
-        // Poll both until either fails
-        tokio::select! {
-            _ = tokio::io::copy(&mut recv, &mut tcp_send) => {}
-            _ = tokio::io::copy(&mut tcp_recv, &mut send) => {}
-        };
-
-        send.finish().ok();
-        recv.stop(0u32.into()).ok();
+        // Errors here are usually just one side going away, proxy already cleaned up the streams
+        if let Err(err) = proxy(&mut stream, send, recv).await {
+            tracing::debug!("conn to {} ended with error: {err}", mapping.dest_addr);
+        }
 
         Ok(())
     }
 
     async fn run(mut self) -> ! {
-        let mut conn = self.iroh_conn_recv.recv().await.unwrap();
+        let mut conn = next_conn(&mut self.iroh_conn_recv).await;
         loop {
             select! {
                 new_conn = self.iroh_conn_recv.recv() => {
@@ -83,11 +102,30 @@ impl PrivateServer {
                 },
                 stream = conn.accept_bi() => {
                     let Ok((send, recv)) = stream else {
+                        // Conn is dead, wait for a new one instead of spinning on accept_bi
+                        conn = next_conn(&mut self.iroh_conn_recv).await;
                         continue;
                     };
-                    tokio::task::spawn_local(Self::handle_stream(self.port_mappings.clone(), send, recv));
+                    tokio::task::spawn_local(Self::handle_stream(
+                        self.port_mappings.clone(),
+                        self.active_streams.clone(),
+                        send,
+                        recv,
+                    ));
                 }
             }
+        }
+    }
+}
+
+/// Waits for the next conn to the public side
+async fn next_conn(conn_recv: &mut broadcast::Receiver<Connection>) -> Connection {
+    loop {
+        match conn_recv.recv().await {
+            Ok(conn) => return conn,
+            // Missed an older conn, the next recv gets the latest one
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => unreachable!("conn sender is never dropped"),
         }
     }
 }
@@ -103,13 +141,15 @@ pub async fn private_side(config: PrivateConfig) -> color_eyre::Result<()> {
     let addr = endpoint.addr();
     tracing::info!("server at {addr:#?}");
 
-    let (conn_send, conn_recv) = tokio::sync::broadcast::channel(1);
+    let (conn_send, conn_recv) = broadcast::channel(1);
+    let active_streams = ActiveStreams::default();
 
     // Spawn up to n-1 threads for handling incoming connections
     for _ in 0..(num_cpus::get() - 1).max(1) {
         let server = PrivateServer {
             iroh_conn_recv: conn_recv.resubscribe(),
             port_mappings: config.port_mappings.clone(),
+            active_streams: active_streams.clone(),
         };
 
         std::thread::spawn(move || {
